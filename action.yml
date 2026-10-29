@@ -1,0 +1,99 @@
+name: Attest mod folder
+description: Attest every file in a built mod folder and embed the Sigstore bundle alongside them.
+ 
+inputs:
+  path:
+    description: Folder containing the built mod (the Workshop item content folder)
+    required: true
+  bundle-name:
+    description: File name for the embedded Sigstore bundle
+    required: false
+    default: provenance.sigstore.json
+  self-verify:
+    description: Run gh attestation verify on the embedded bundle before finishing
+    required: false
+    default: "true"
+ 
+outputs:
+  attestation-url:
+    description: URL of the attestation stored on GitHub
+    value: ${{ steps.attest.outputs.attestation-url }}
+  subject-count:
+    description: Number of files covered by the attestation
+    value: ${{ steps.checksums.outputs.count }}
+ 
+runs:
+  using: composite
+  steps:
+    - name: Hash every file in the folder
+      id: checksums
+      shell: bash
+      env:
+        MOD_DIR: ${{ inputs.path }}
+        BUNDLE: ${{ inputs.bundle-name }}
+      run: |
+        set -euo pipefail
+        test -d "$MOD_DIR" || { echo "::error::'$MOD_DIR' is not a directory"; exit 1; }
+        cd "$MOD_DIR"
+        # Remove outputs from a previous run so they are never attested or re-hashed.
+        rm -f SHA256SUMS provenance.json "$BUNDLE"
+        # Relative paths, sorted, NUL-safe. One subject per file.
+        find . -type f -print0 | sed -z 's#^\./##' | sort -z | xargs -0 sha256sum > SHA256SUMS
+        COUNT=$(wc -l < SHA256SUMS)
+        if [ "$COUNT" -eq 0 ]; then echo "::error::no files found in $MOD_DIR"; exit 1; fi
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "Manifest covers $COUNT files:"; cat SHA256SUMS
+    - name: Attest build provenance
+      id: attest
+      uses: actions/attest-build-provenance@v2
+      with:
+        subject-path: ${{ inputs.path }}/SHA256SUMS
+ 
+    - name: Embed bundle and provenance pointer
+      shell: bash
+      env:
+        MOD_DIR: ${{ inputs.path }}
+        BUNDLE: ${{ inputs.bundle-name }}
+        BUNDLE_SRC: ${{ steps.attest.outputs.bundle-path }}
+        ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        ACTION_REPO: ${{ github.action_repository }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        cp "$BUNDLE_SRC" "$MOD_DIR/$BUNDLE"
+        cat > "$MOD_DIR/provenance.json" <<EOF
+        {
+          "source_repository": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}",
+          "source_commit": "${GITHUB_SHA}",
+          "source_ref": "${GITHUB_REF}",
+          "build_workflow": "${GITHUB_WORKFLOW_REF}",
+          "workflow_run": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}",
+          "attestation_url": "${ATTESTATION_URL}",
+          "attested_by_action": "${ACTION_REPO}@${ACTION_REF}",
+          "bundle_file": "${BUNDLE}",
+          "checksums_file": "SHA256SUMS"
+        }
+        EOF
+        echo "### Mod provenance embedded" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Source: \`${GITHUB_REPOSITORY}@${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Workflow: \`${GITHUB_WORKFLOW_REF}\`" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Attestation: ${ATTESTATION_URL}" >> "$GITHUB_STEP_SUMMARY"
+ 
+    - name: Self-verify embedded bundle
+      if: inputs.self-verify == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        MOD_DIR: ${{ inputs.path }}
+        BUNDLE: ${{ inputs.bundle-name }}
+      run: |
+        set -euo pipefail
+        cd "$MOD_DIR"
+        gh attestation verify SHA256SUMS \
+          --bundle "$BUNDLE" \
+          --repo "$GITHUB_REPOSITORY" \
+          --predicate-type https://slsa.dev/provenance/v1 \
+          --deny-self-hosted-runners >/dev/null
+        sha256sum --check --strict --quiet SHA256SUMS
+        echo "Manifest verified against $BUNDLE; $(wc -l < SHA256SUMS) files match the manifest"
+ 
