@@ -37,8 +37,13 @@ runs:
         cd "$MOD_DIR"
         # Remove outputs from a previous run so they are never attested or re-hashed.
         rm -f SHA256SUMS provenance.json "$BUNDLE"
-        # Relative paths, sorted, NUL-safe. One subject per file.
-        find . -type f -print0 | sed -z 's#^\./##' | sort -z | xargs -0 sha256sum > SHA256SUMS
+        # Relative paths, sorted, NUL-safe. Provenance files are excluded by name,
+        # and the manifest is written outside the folder first so `find` can never
+        # see a partially written SHA256SUMS and list it in itself.
+        find . -type f \
+            ! -name SHA256SUMS ! -name provenance.json ! -name "$BUNDLE" \
+            -print0 | sed -z 's#^\./##' | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/SHA256SUMS"
+        mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
         COUNT=$(wc -l < SHA256SUMS)
         if [ "$COUNT" -eq 0 ]; then echo "::error::no files found in $MOD_DIR"; exit 1; fi
         echo "count=$COUNT" >> "$GITHUB_OUTPUT"
